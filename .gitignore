@@ -1,0 +1,21 @@
+# Node.js
+node_modules/
+npm-debug.log
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.local-browsers
