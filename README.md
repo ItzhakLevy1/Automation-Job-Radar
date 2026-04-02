@@ -19,21 +19,14 @@ playwright install chromium
 
 
 # Running the Project
-# To use the project with n8n, you need to have the Bridge server running:
-
-# Start the Bridge server
-node bridge.js
-
-### 3. Running the Project
-
 # To use the automation, you need to have **two** separate terminal windows running:
 
-#### Terminal 1: Start the Bridge Server
-# This server acts as the intermediary between n8n and your Python scripts, In it run:
+# Terminal 1: Start the Bridge Server
+# This server acts as the intermediary between n8n and your Python scripts, To activate it run:
 
 node bridge.js
 
 # Terminal 2: Start n8n
-# This launches the automation workflow engine, In it run:
+# This launches the automation workflow engine, To activate it run:
 
 npx n8n start
