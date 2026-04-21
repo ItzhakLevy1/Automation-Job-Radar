@@ -1,161 +1,184 @@
-import sys  # Import system-specific parameters and functions for CLI arguments
-import io   # Import io for encoding management
-from playwright.sync_api import sync_playwright  # Import the synchronous version of Playwright
+import sys
+import io
+import math
+import json
+from playwright.sync_api import sync_playwright
 
-# Force UTF-8 encoding for standard output to support Hebrew characters in n8n/Node.js
+# --- CONFIGURATION & ENCODING ---
+# Ensure the terminal handles Hebrew characters correctly for automation logging
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# Define a function to run the web scanner using Playwright
-# Now accepts 'strategy' to decide between a surface scan or a deep click-through scan
-def run_scanner(url, strategy):
-    # 'with' ensures resources like the browser are properly closed after use
-    with sync_playwright() as p:
+def scroll_to_bottom(page):
+    """
+    Handles page scrolling and 'Load More' button interaction.
+    Specifically optimized for Elbit Systems and MUI-based job boards.
+    """
+    print("Waiting for page loader...")
+    sys.stdout.flush()
+    try:
+        # Wait for the Hebrew 'Loading Jobs' spinner to disappear
+        page.wait_for_selector("text=טוען משרות", state="hidden", timeout=15000)
+    except Exception:
+        pass
+
+    last_height = page.evaluate("document.body.scrollHeight")
+    
+    # Loop to scroll and click 'Load More' up to 8 times
+    for attempt in range(8): 
+        print(f"--- Scroll Attempt {attempt + 1} ---")
+        sys.stdout.flush()
         
-        # We manually set the window size to a standard Full HD resolution
+        # Scroll to the current bottom
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(2000) 
+
+        # Look for the 'Load More' button in Hebrew
+        load_more_button = page.locator("button").filter(has_text="תוצאות חיפוש נוספות").first
+        
+        if load_more_button.is_visible():
+            print(f"Clicking 'Load More' button...")
+            sys.stdout.flush()
+            try:
+                load_more_button.scroll_into_view_if_needed()
+                load_more_button.click(force=True)
+                page.wait_for_timeout(1500)
+                continue 
+            except Exception:
+                pass
+        
+        new_height = page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+def process_text(raw_text):
+    """
+    Filters raw page text to keep only relevant tech job information.
+    Reduces the payload size for the AI by removing non-tech noise.
+    """
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    keywords = [
+        'qa', 'automation', 'full stack', 'frontend', 'backend', 'developer', 
+        'software', 'engineer', 'junior', 'entry', 'graduate', 'intern',
+        'בדיקות', 'פיתוח', 'תוכנה', 'מתכנת', 'אוטומציה', 'בודק', 'ג\'וניור', 
+        'ללא ניסיון', 'מתחיל', 'בוגר', 'ידניות'
+    ]
+    
+    relevant_content = []
+    for i in range(len(lines)):
+        current_line_lower = lines[i].lower()
+        if any(word in current_line_lower for word in keywords):
+            # Capture context: 5 lines above and 13 lines below
+            start = max(0, i - 5)
+            end = min(len(lines), i + 13)
+            relevant_content.extend(lines[start:end])
+            
+    result = "\n".join(list(dict.fromkeys(relevant_content)))
+    return result if len(result) > 100 else "\n".join(lines[:200])
+
+def run_scanner(url, strategy):
+    """
+    Main execution logic for scanning a job board.
+    Detects site type, runs strategy, and splits output into chunks.
+    """
+    # Force 'scroll' strategy for Elbit Systems
+    if "elbit" in url.lower():
+        strategy = "scroll"
+
+    with sync_playwright() as p:
+        print("!!!!!!!!!!!!!!!! SCRAPER INITIALIZED !!!!!!!!!!!!!!!!")
+        sys.stdout.flush()
+        
         browser = p.chromium.launch(
             headless=False, 
-            slow_mo=1000,
-            args=[
-                "--window-size=1920,1080",
-                "--window-position=0,0",
-                "--force-device-scale-factor=1" # Ensures no weird zooming
-            ]
+            args=["--window-size=1920,1080", "--force-device-scale-factor=1"]
         )
-        
-        # Explicitly setting the viewport to match the window size
         context = browser.new_context(viewport={'width': 1920, 'height': 1080})
-        
         page = context.new_page()
         
-        # Bring the page to the front and ensure it has focus
-        page.bring_to_front()
-
-        # Adding a small focus command to ensure the window is active
-        page.focus("body") 
+        print(f"Opening URL: {url} | Strategy: {strategy}")
+        sys.stdout.flush()
         
-        print(f"Navigating to: {url} with strategy: {strategy}")
-        
-        # Navigate to the target URL
         page.goto(url, wait_until="networkidle", timeout=60000)
-        
-        # Small sleep to let the UI catch up
         page.wait_for_timeout(3000)
 
-        # --- STRATEGY BRANCHING START ---
-        
         final_text = ""
 
-        if strategy == "deep":
-            # Keywords to identify relevant job links or buttons for clicking
+        if strategy == "scroll":
+            scroll_to_bottom(page)
+            raw_text = page.inner_text("body")
+            final_text = process_text(raw_text)
+            
+        elif strategy == "deep":
             job_keywords = ['qa', 'automation', 'test', 'software', 'developer', 'בדיקות', 'אוטומציה', 'פיתוח']
             action_keywords = ['apply', 'details', 'view', 'לפרטים', 'הגש', 'צפייה']
-
             combined_results = []
-
-            # Find all potential entry points (links or buttons)
-            elements = page.query_selector_all("a, button, [role='button']")
             
-            valid_links = []
-            for el in elements:
-                text = (el.inner_text() or "").lower()
-                # If the element contains job or action keywords, we consider it a candidate
-                if any(kw in text for kw in job_keywords + action_keywords):
-                    valid_links.append(el)
-
-            print(f"Found {len(valid_links)} potential job elements. Starting deep scan...")
-
-            # Limit the scan to the first 15 items to prevent timeouts and excessive resource use
-            for i in range(min(len(valid_links), 15)): 
+            elements = page.query_selector_all("a, button, [role='button']")
+            valid_links = [el for el in elements if any(kw in (el.inner_text() or "").lower() for kw in job_keywords + action_keywords)]
+            
+            for i in range(min(len(valid_links), 15)):
                 try:
-                    # Re-fetch elements briefly if needed, but here we use the original list
                     current_el = valid_links[i]
-                    
-                    if not current_el.is_visible():
-                        continue
-
+                    if not current_el.is_visible(): continue
                     job_title_context = current_el.inner_text().strip()
-                    print(f"Deep Scanning: {job_title_context}")
-
-                    # Perform the click to enter the job page
                     current_el.click()
-                    page.wait_for_timeout(3000) # Wait for the description page to load
-                    
-                    # Capture the full text of the job description page
+                    page.wait_for_timeout(3000)
                     job_description = page.inner_text("body")
                     combined_results.append(f"--- JOB START ---\nContext: {job_title_context}\nContent: {job_description}\n--- JOB END ---\n")
-                    
-                    # Navigate back to the main list to continue the loop
                     page.go_back(wait_until="domcontentloaded")
                     page.wait_for_timeout(2000)
-
-                except Exception as e:
-                    print(f"Skipping element {i} due to error: {str(e)}")
-                    # Ensure we are back on the main URL if a click led us astray
-                    if page.url != url:
-                        page.goto(url)
-
+                except Exception:
+                    if page.url != url: page.goto(url)
             final_text = "\n".join(combined_results)
-        
-        # Fallback or "Simple" strategy: Just grab the text from the main page
-        if strategy == "simple" or not final_text:
-            print("Executing simple surface scan...")
+
+        # Fallback for empty results
+        if not final_text or len(final_text) < 100:
             raw_text = page.inner_text("body")
-            
-            # Use your original logic to filter keywords on the main page
-            lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-            keywords = [
-                'qa', 'automation', 'full stack', 'frontend', 'backend', 'developer', 
-                'software', 'engineer', 'junior', 'entry', 'graduate', 'intern',
-                'בדיקות', 'פיתוח', 'תוכנה', 'מתכנת', 'אוטומציה', 'בודק', 'ג\'וניור', 
-                'ללא ניסיון', 'מתחיל', 'בוגר', 'ידניות'
-            ]
-            
-            relevant_content = []
-            for i in range(len(lines)):
-                current_line_lower = lines[i].lower()
-                if any(word in current_line_lower for word in keywords):
-                    start = max(0, i - 5)
-                    end = min(len(lines), i + 13)
-                    relevant_content.extend(lines[start:end])
-            
-            final_text = "\n".join(list(dict.fromkeys(relevant_content)))
-            
-            # Final fallback if keyword filtering was too aggressive
-            if len(final_text) < 100:
-                final_text = "\n".join(lines[:200])
+            final_text = process_text(raw_text)
 
-        # --- STRATEGY BRANCHING END ---
+        # --- SITE NAME IDENTIFICATION (ROBUST VERSION) ---
+        url_lower = url.lower()
+        if "elbit" in url_lower:
+            site_name = "Elbit Systems"
+        elif "tesnet" in url_lower:
+            site_name = "Tesnet"
+        elif "peak" in url_lower:
+            site_name = "Peak Innovation"
+        else:
+            # Fallback: Extract from domain (e.g., https://site.com -> Site)
+            site_name = url.split("//")[-1].split(".")[0].capitalize()
 
-        print(f"Extraction finished. Captured {len(final_text)} characters.")
-        
-        # Stay for a few seconds to ensure logs are captured
-        page.wait_for_timeout(3000)
-        
+        # The clean header YOU want
+        header = f"🚩 SITE: {site_name} 🚩"
         browser.close()
-        
-        return final_text
 
-# Main execution block
+        # --- CHUNKING LOGIC ---
+        chunk_size = 7000
+        if len(final_text) > chunk_size:
+            num_chunks = math.ceil(len(final_text) / chunk_size)
+            chunks = [final_text[i:i + chunk_size] for i in range(0, len(final_text), chunk_size)]
+            return [f"{header} (Part {idx+1}/{len(chunks)})\n{c}" for idx, c in enumerate(chunks)]
+        else:
+            return [f"{header}\n{final_text}"]
+
 if __name__ == "__main__":
+    target_url = sys.argv[1] if len(sys.argv) > 1 else ""
+    selected_strategy = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "simple"
     
-    # sys.argv[1] is the URL
-    target_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.google.com"
+    if not target_url:
+        sys.exit(1)
 
-    # sys.argv[2] is the Strategy (simple or deep) passed from n8n
-    # Defaults to 'simple' if the second argument is missing
-    strategy = sys.argv[2] if len(sys.argv) > 2 else "simple"
-    
     try:
-        # Execute the scanner function with both URL and Strategy
-        result_content = run_scanner(target_url, strategy)
-        
-        # Print the success marker followed by the data
-        # We limit to 50k characters to keep the n8n buffer manageable
+        output_list = run_scanner(target_url, selected_strategy)
         print(f"SOURCE_URL: {target_url}")
-        print(f"SUCCESS_DATA: {result_content[:50000]}") 
+        # Return as JSON array for n8n processing
+        print(f"SUCCESS_DATA_JSON: {json.dumps(output_list)}")
+        sys.stdout.flush()
         
     except Exception as e:
         # Catch and report errors to n8n
         print(f"ERROR: {str(e)}")
+        sys.stdout.flush()
         sys.exit(1)
